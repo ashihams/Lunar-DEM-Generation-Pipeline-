@@ -1,0 +1,499 @@
+-- NASA Lunar Data Pipeline - Snowflake Schema Setup
+-- This creates the complete database structure for the lunar imagery pipeline
+
+-- ============================================================================
+-- 1. DATABASE AND WAREHOUSE SETUP
+-- ============================================================================
+
+-- Create database and schemas
+CREATE DATABASE IF NOT EXISTS LUNAR_DATA;
+USE DATABASE LUNAR_DATA;
+
+CREATE SCHEMA IF NOT EXISTS BRONZE;  -- Raw ingested data
+CREATE SCHEMA IF NOT EXISTS SILVER;  -- Cleaned and enriched data
+CREATE SCHEMA IF NOT EXISTS GOLD;    -- Analytics-ready datasets
+
+-- Create compute resources
+CREATE WAREHOUSE IF NOT EXISTS LUNAR_ETL_WH
+  WITH WAREHOUSE_SIZE = 'LARGE'
+       AUTO_SUSPEND = 300
+       AUTO_RESUME = TRUE
+       INITIALLY_SUSPENDED = TRUE;
+
+-- Create roles and permissions
+CREATE ROLE IF NOT EXISTS LUNAR_ENGINEER;
+CREATE ROLE IF NOT EXISTS LUNAR_ANALYST;
+CREATE ROLE IF NOT EXISTS LUNAR_READER;
+
+-- Grant permissions
+GRANT USAGE ON WAREHOUSE LUNAR_ETL_WH TO ROLE LUNAR_ENGINEER;
+GRANT ALL ON DATABASE LUNAR_DATA TO ROLE LUNAR_ENGINEER;
+GRANT ALL ON SCHEMA LUNAR_DATA.BRONZE TO ROLE LUNAR_ENGINEER;
+GRANT ALL ON SCHEMA LUNAR_DATA.SILVER TO ROLE LUNAR_ENGINEER;
+GRANT ALL ON SCHEMA LUNAR_DATA.GOLD TO ROLE LUNAR_ENGINEER;
+
+-- ============================================================================
+-- 2. STORAGE INTEGRATION AND STAGES
+-- ============================================================================
+
+-- Create storage integration (replace with your cloud provider details)
+CREATE STORAGE INTEGRATION IF NOT EXISTS LUNAR_S3_INTEGRATION
+  TYPE = EXTERNAL_STAGE
+  STORAGE_PROVIDER = S3
+  ENABLED = TRUE
+  STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::YOUR_ACCOUNT:role/snowflake-lunar-role'
+  STORAGE_ALLOWED_LOCATIONS = ('s3://your-lunar-bucket/');
+
+-- Create file formats
+CREATE FILE FORMAT IF NOT EXISTS JSON_FORMAT
+  TYPE = JSON
+  STRIP_OUTER_ARRAY = TRUE
+  NULL_IF = ('');
+
+CREATE FILE FORMAT IF NOT EXISTS CSV_FORMAT
+  TYPE = CSV
+  FIELD_DELIMITER = ','
+  SKIP_HEADER = 1
+  NULL_IF = ('NULL', 'null', '');
+
+-- Create stages
+CREATE STAGE IF NOT EXISTS LUNAR_RAW_STAGE
+  STORAGE_INTEGRATION = LUNAR_S3_INTEGRATION
+  URL = 's3://your-lunar-bucket/raw/'
+  FILE_FORMAT = JSON_FORMAT;
+
+CREATE STAGE IF NOT EXISTS LUNAR_PROCESSED_STAGE
+  STORAGE_INTEGRATION = LUNAR_S3_INTEGRATION
+  URL = 's3://your-lunar-bucket/processed/'
+  FILE_FORMAT = JSON_FORMAT;
+
+-- ============================================================================
+-- 3. BRONZE LAYER - RAW DATA TABLES
+-- ============================================================================
+USE SCHEMA BRONZE;
+
+-- Core product metadata table
+CREATE TABLE IF NOT EXISTS LUNAR_PRODUCTS (
+    PRODUCT_ID              STRING PRIMARY KEY,
+    INSTRUMENT              STRING NOT NULL,           -- NAC-L, NAC-R, WAC
+    DATA_PRODUCT_TYPE       STRING NOT NULL,           -- raw, cal, drv, map
+    START_TIME              TIMESTAMP_TZ NOT NULL,
+    STOP_TIME               TIMESTAMP_TZ,
+    RESOLUTION_M            FLOAT,
+    INCIDENCE_DEG           FLOAT,
+    EMISSION_DEG            FLOAT,
+    PHASE_DEG               FLOAT,
+    SUN_AZIMUTH_DEG         FLOAT,
+    FOOTPRINT_WKT           STRING,
+    FOOTPRINT_GEOM          GEOGRAPHY,                 -- Computed from WKT
+    CENTER_LAT              FLOAT,
+    CENTER_LON              FLOAT,
+    IMAGE_WIDTH             INTEGER,
+    IMAGE_HEIGHT            INTEGER,
+    FILE_URL                STRING,                    -- Original NASA URL
+    LABEL_URL               STRING,
+    ORBIT_NUMBER            INTEGER,
+    MISSION_PHASE           STRING,
+    TARGET_NAME             STRING DEFAULT 'MOON',
+    PROCESSING_LEVEL        STRING,
+    DATA_QUALITY            STRING,
+    INGESTED_AT             TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),
+    UPDATED_AT              TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- File inventory and processing status
+CREATE TABLE IF NOT EXISTS LUNAR_FILES (
+    PRODUCT_ID              STRING NOT NULL,
+    FILE_TYPE               STRING NOT NULL,           -- RAW_IMG, LABEL, COG, THUMB, CALIBRATED, SUPERRES
+    FILE_PATH               STRING NOT NULL,           -- Local storage path
+    S3_PATH                 STRING,                    -- Cloud storage path
+    SIZE_BYTES              NUMBER,
+    CHECKSUM_SHA256         STRING,
+    PROCESSING_LEVEL        STRING NOT NULL,           -- RAW, CAL, DRV, COG
+    PROCESSING_STATUS       STRING DEFAULT 'PENDING',  -- PENDING, PROCESSING, COMPLETED, FAILED
+    PROCESSING_RESULTS      VARIANT,                   -- JSON with processing details
+    CREATED_AT              TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),
+    UPDATED_AT              TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),
+    
+    PRIMARY KEY (PRODUCT_ID, FILE_TYPE),
+    FOREIGN KEY (PRODUCT_ID) REFERENCES LUNAR_PRODUCTS(PRODUCT_ID)
+);
+
+-- LOLA altimetry data for elevation control
+CREATE TABLE IF NOT EXISTS LOLA_ALTIMETRY (
+    TRACK_ID                STRING NOT NULL,
+    SHOT_NUMBER             NUMBER NOT NULL,
+    LONGITUDE_DEG           FLOAT NOT NULL,
+    LATITUDE_DEG            FLOAT NOT NULL,
+    ELEVATION_M             FLOAT NOT NULL,
+    ROUGHNESS               FLOAT,
+    REFLECTANCE             FLOAT,
+    QUALITY_FLAG            STRING,
+    OBSERVATION_TIME        TIMESTAMP_TZ,
+    ORBIT_NUMBER            INTEGER,
+    GEOM_POINT              GEOGRAPHY,                 -- Point geometry
+    INGESTED_AT             TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),
+    
+    PRIMARY KEY (TRACK_ID, SHOT_NUMBER)
+);
+
+-- SPICE kernel inventory for geometric processing
+CREATE TABLE IF NOT EXISTS SPICE_KERNELS (
+    FILENAME                STRING PRIMARY KEY,
+    KERNEL_TYPE             STRING NOT NULL,           -- LSK, SPK, CK, SCLK, IK, FK, PCK
+    KERNEL_SUBTYPE          STRING,
+    DESCRIPTION             STRING,
+    VERSION                 STRING,
+    INSTRUMENT              STRING,                    -- Associated instrument
+    TIME_COVERAGE_START     TIMESTAMP_TZ,
+    TIME_COVERAGE_STOP      TIMESTAMP_TZ,
+    FILE_URL                STRING,                    -- Original NAIF URL
+    S3_PATH                 STRING,                    -- Our storage path
+    SIZE_BYTES              NUMBER,
+    CHECKSUM_SHA256         STRING,
+    IS_ACTIVE               BOOLEAN DEFAULT TRUE,
+    LAST_UPDATED            TIMESTAMP_TZ,
+    INGESTED_AT             TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- Processing pipeline execution log
+CREATE TABLE IF NOT EXISTS PROCESSING_LOG (
+    LOG_ID                  STRING DEFAULT UUID_STRING() PRIMARY KEY,
+    PRODUCT_ID              STRING NOT NULL,
+    PIPELINE_STAGE          STRING NOT NULL,           -- DOWNLOAD, CALIBRATE, ENHANCE, STITCH
+    STATUS                  STRING NOT NULL,           -- STARTED, COMPLETED, FAILED
+    START_TIME              TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),
+    END_TIME                TIMESTAMP_TZ,
+    PROCESSING_TIME_SEC     NUMBER,
+    INPUT_FILES             ARRAY,
+    OUTPUT_FILES            ARRAY,
+    PARAMETERS              VARIANT,                   -- Processing parameters as JSON
+    ERROR_MESSAGE           STRING,
+    WORKER_ID               STRING,
+    RESOURCE_USAGE          VARIANT,                   -- CPU, memory, GPU usage stats
+    
+    FOREIGN KEY (PRODUCT_ID) REFERENCES LUNAR_PRODUCTS(PRODUCT_ID)
+);
+
+-- Quality control metrics
+CREATE TABLE IF NOT EXISTS QUALITY_METRICS (
+    PRODUCT_ID              STRING NOT NULL,
+    METRIC_TYPE             STRING NOT NULL,           -- GEOMETRIC, RADIOMETRIC, ENHANCEMENT
+    METRIC_NAME             STRING NOT NULL,           -- RMSE, SNR, SSIM, etc.
+    METRIC_VALUE            FLOAT,
+    THRESHOLD_MIN           FLOAT,
+    THRESHOLD_MAX           FLOAT,
+    IS_WITHIN_THRESHOLD     BOOLEAN,
+    COMPUTED_AT             TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),
+    
+    PRIMARY KEY (PRODUCT_ID, METRIC_TYPE, METRIC_NAME),
+    FOREIGN KEY (PRODUCT_ID) REFERENCES LUNAR_PRODUCTS(PRODUCT_ID)
+);
+
+-- ============================================================================
+-- 4. SILVER LAYER - CLEANED AND ENRICHED DATA
+-- ============================================================================
+USE SCHEMA SILVER;
+
+-- Enhanced product view with computed geometry and enrichments
+CREATE TABLE IF NOT EXISTS PRODUCTS_ENHANCED AS
+SELECT 
+    p.*,
+    ST_GEOMFROMWKT(p.FOOTPRINT_WKT) AS FOOTPRINT_GEOM,
+    ST_CENTROID(ST_GEOMFROMWKT(p.FOOTPRINT_WKT)) AS CENTER_GEOM,
+    ST_AREA(ST_GEOMFROMWKT(p.FOOTPRINT_WKT)) AS COVERAGE_AREA_DEG2,
+    CASE 
+        WHEN p.INSTRUMENT LIKE 'NAC%' THEN 'Narrow Angle Camera'
+        WHEN p.INSTRUMENT = 'WAC' THEN 'Wide Angle Camera'
+        ELSE p.INSTRUMENT 
+    END AS INSTRUMENT_FULL_NAME,
+    CASE
+        WHEN p.INCIDENCE_DEG < 10 THEN 'Low Incidence'
+        WHEN p.INCIDENCE_DEG < 45 THEN 'Medium Incidence' 
+        WHEN p.INCIDENCE_DEG < 80 THEN 'High Incidence'
+        ELSE 'Grazing Incidence'
+    END AS INCIDENCE_CATEGORY,
+    CASE
+        WHEN p.RESOLUTION_M < 1.0 THEN 'High Resolution'
+        WHEN p.RESOLUTION_M < 5.0 THEN 'Medium Resolution'
+        ELSE 'Low Resolution'
+    END AS RESOLUTION_CATEGORY,
+    -- Lunar time calculations
+    DATEDIFF('day', '2009-06-23', p.START_TIME) AS MISSION_DAY,
+    EXTRACT(YEAR FROM p.START_TIME) AS OBSERVATION_YEAR,
+    EXTRACT(MONTH FROM p.START_TIME) AS OBSERVATION_MONTH
+FROM BRONZE.LUNAR_PRODUCTS p
+WHERE p.FOOTPRINT_WKT IS NOT NULL;
+
+-- Products with successful processing status
+CREATE VIEW PRODUCTS_PROCESSED AS
+SELECT 
+    pe.*,
+    f.PROCESSING_STATUS,
+    f.PROCESSING_RESULTS,
+    f.S3_PATH AS PROCESSED_FILE_PATH,
+    f.SIZE_BYTES AS PROCESSED_FILE_SIZE,
+    f.UPDATED_AT AS PROCESSING_COMPLETED_AT
+FROM PRODUCTS_ENHANCED pe
+JOIN BRONZE.LUNAR_FILES f ON pe.PRODUCT_ID = f.PRODUCT_ID
+WHERE f.FILE_TYPE IN ('COG', 'CALIBRATED', 'SUPERRES', 'STITCHED')
+  AND f.PROCESSING_STATUS = 'COMPLETED';
+
+-- Spatial index for efficient geographic queries
+CREATE TABLE IF NOT EXISTS SPATIAL_GRID AS
+SELECT 
+    ROW_NUMBER() OVER () AS GRID_ID,
+    GRID_LON,
+    GRID_LAT,
+    ST_MAKEPOINT(GRID_LON, GRID_LAT) AS GRID_POINT,
+    ST_BUFFER(ST_MAKEPOINT(GRID_LON, GRID_LAT), 1.0) AS GRID_CELL -- 1 degree buffer
+FROM (
+    SELECT 
+        seq4() AS GRID_LON_SEQ,
+        (seq4() * 5.0 - 180.0) AS GRID_LON
+    FROM TABLE(GENERATOR(ROWCOUNT => 72)) -- 5-degree longitude grid
+) lon_grid
+CROSS JOIN (
+    SELECT 
+        seq4() AS GRID_LAT_SEQ,
+        (seq4() * 5.0 - 90.0) AS GRID_LAT  
+    FROM TABLE(GENERATOR(ROWCOUNT => 36)) -- 5-degree latitude grid  
+) lat_grid;
+
+-- Image pairs for stereo processing (NAC-L and NAC-R)
+CREATE VIEW STEREO_PAIRS AS
+SELECT 
+    l.PRODUCT_ID AS LEFT_PRODUCT_ID,
+    r.PRODUCT_ID AS RIGHT_PRODUCT_ID,
+    l.START_TIME,
+    l.ORBIT_NUMBER,
+    ST_DISTANCE(l.CENTER_GEOM, r.CENTER_GEOM) AS SEPARATION_DEG,
+    ABS(l.INCIDENCE_DEG - r.INCIDENCE_DEG) AS INCIDENCE_DIFF,
+    ST_INTERSECTS(l.FOOTPRINT_GEOM, r.FOOTPRINT_GEOM) AS HAS_OVERLAP,
+    ST_INTERSECTION(l.FOOTPRINT_GEOM, r.FOOTPRINT_GEOM) AS OVERLAP_GEOM
+FROM PRODUCTS_ENHANCED l
+JOIN PRODUCTS_ENHANCED r ON l.ORBIT_NUMBER = r.ORBIT_NUMBER
+    AND ABS(DATEDIFF('second', l.START_TIME, r.START_TIME)) < 300  -- Within 5 minutes
+WHERE l.INSTRUMENT = 'NAC-L' 
+  AND r.INSTRUMENT = 'NAC-R'
+  AND ST_DISTANCE(l.CENTER_GEOM, r.CENTER_GEOM) < 2.0  -- Within 2 degrees
+  AND ST_INTERSECTS(l.FOOTPRINT_GEOM, r.FOOTPRINT_GEOM);
+
+-- ============================================================================
+-- 5. GOLD LAYER - ANALYTICS AND ML READY DATASETS
+-- ============================================================================
+USE SCHEMA GOLD;
+
+-- Coverage analysis by region
+CREATE TABLE IF NOT EXISTS REGIONAL_COVERAGE AS
+SELECT 
+    CASE 
+        WHEN pe.CENTER_LAT > 60 THEN 'North Polar'
+        WHEN pe.CENTER_LAT < -60 THEN 'South Polar'  
+        WHEN ABS(pe.CENTER_LAT) < 30 THEN 'Equatorial'
+        WHEN pe.CENTER_LAT > 0 THEN 'North Mid-Latitude'
+        ELSE 'South Mid-Latitude'
+    END AS REGION,
+    pe.INSTRUMENT,
+    pe.RESOLUTION_CATEGORY,
+    COUNT(*) AS IMAGE_COUNT,
+    SUM(pe.COVERAGE_AREA_DEG2) AS TOTAL_COVERAGE_DEG2,
+    AVG(pe.RESOLUTION_M) AS AVG_RESOLUTION_M,
+    MIN(pe.START_TIME) AS FIRST_OBSERVATION,
+    MAX(pe.START_TIME) AS LAST_OBSERVATION,
+    COUNT(DISTINCT DATE(pe.START_TIME)) AS OBSERVATION_DAYS
+FROM SILVER.PRODUCTS_ENHANCED pe
+GROUP BY REGION, pe.INSTRUMENT, pe.RESOLUTION_CATEGORY;
+
+-- ML training dataset with features
+CREATE TABLE IF NOT EXISTS ML_TRAINING_FEATURES AS
+SELECT 
+    pe.PRODUCT_ID,
+    pe.INSTRUMENT,
+    pe.RESOLUTION_M,
+    pe.INCIDENCE_DEG,
+    pe.EMISSION_DEG, 
+    pe.PHASE_DEG,
+    pe.SUN_AZIMUTH_DEG,
+    pe.CENTER_LAT,
+    pe.CENTER_LON,
+    pe.COVERAGE_AREA_DEG2,
+    -- Temporal features
+    pe.MISSION_DAY,
+    SIN(2 * PI() * pe.MISSION_DAY / 365.25) AS SEASONAL_SIN,
+    COS(2 * PI() * pe.MISSION_DAY / 365.25) AS SEASONAL_COS,
+    -- Geometric features
+    SQRT(pe.CENTER_LAT * pe.CENTER_LAT + pe.CENTER_LON * pe.CENTER_LON) AS DISTANCE_FROM_ORIGIN,
+    CASE WHEN pe.CENTER_LAT >= 0 THEN 1 ELSE 0 END AS IS_NORTHERN_HEMISPHERE,
+    -- Quality indicators from processing
+    COALESCE(qm_geom.METRIC_VALUE, 0) AS GEOMETRIC_QUALITY,
+    COALESCE(qm_radio.METRIC_VALUE, 0) AS RADIOMETRIC_QUALITY,
+    -- Processing complexity indicators
+    CASE pe.DATA_PRODUCT_TYPE
+        WHEN 'raw' THEN 3  -- Most processing needed
+        WHEN 'cal' THEN 2  -- Medium processing
+        WHEN 'drv' THEN 1  -- Least processing
+        ELSE 0
+    END AS PROCESSING_COMPLEXITY,
+    -- Target variables (for supervised learning)
+    f.PROCESSING_STATUS = 'COMPLETED' AS PROCESSING_SUCCESS,
+    COALESCE(pl.PROCESSING_TIME_SEC, 0) AS PROCESSING_TIME_SEC
+FROM SILVER.PRODUCTS_ENHANCED pe
+LEFT JOIN BRONZE.LUNAR_FILES f ON pe.PRODUCT_ID = f.PRODUCT_ID AND f.FILE_TYPE = 'COG'
+LEFT JOIN BRONZE.QUALITY_METRICS qm_geom ON pe.PRODUCT_ID = qm_geom.PRODUCT_ID 
+    AND qm_geom.METRIC_TYPE = 'GEOMETRIC' AND qm_geom.METRIC_NAME = 'RMSE'
+LEFT JOIN BRONZE.QUALITY_METRICS qm_radio ON pe.PRODUCT_ID = qm_radio.PRODUCT_ID 
+    AND qm_radio.METRIC_TYPE = 'RADIOMETRIC' AND qm_radio.METRIC_NAME = 'SNR'
+LEFT JOIN BRONZE.PROCESSING_LOG pl ON pe.PRODUCT_ID = pl.PRODUCT_ID 
+    AND pl.STATUS = 'COMPLETED'
+WHERE pe.START_TIME >= '2009-07-01';  -- Mission start
+
+-- Processing performance analytics
+CREATE TABLE IF NOT EXISTS PROCESSING_ANALYTICS AS
+SELECT 
+    DATE(pl.START_TIME) AS PROCESSING_DATE,
+    pl.PIPELINE_STAGE,
+    pe.INSTRUMENT,
+    pe.DATA_PRODUCT_TYPE,
+    COUNT(*) AS JOBS_COUNT,
+    COUNT(CASE WHEN pl.STATUS = 'COMPLETED' THEN 1 END) AS SUCCESS_COUNT,
+    COUNT(CASE WHEN pl.STATUS = 'FAILED' THEN 1 END) AS FAILURE_COUNT,
+    AVG(pl.PROCESSING_TIME_SEC) AS AVG_PROCESSING_TIME_SEC,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY pl.PROCESSING_TIME_SEC) AS MEDIAN_PROCESSING_TIME_SEC,
+    AVG(COALESCE(pl.RESOURCE_USAGE:cpu_percent::FLOAT, 0)) AS AVG_CPU_USAGE,
+    AVG(COALESCE(pl.RESOURCE_USAGE:memory_gb::FLOAT, 0)) AS AVG_MEMORY_GB,
+    AVG(COALESCE(pl.RESOURCE_USAGE:gpu_utilization::FLOAT, 0)) AS AVG_GPU_UTILIZATION
+FROM BRONZE.PROCESSING_LOG pl
+JOIN SILVER.PRODUCTS_ENHANCED pe ON pl.PRODUCT_ID = pe.PRODUCT_ID
+GROUP BY PROCESSING_DATE, pl.PIPELINE_STAGE, pe.INSTRUMENT, pe.DATA_PRODUCT_TYPE;
+
+-- ============================================================================
+-- 6. INDEXES AND OPTIMIZATION
+-- ============================================================================
+
+-- Create search optimization for common query patterns
+ALTER TABLE BRONZE.LUNAR_PRODUCTS ADD SEARCH OPTIMIZATION;
+ALTER TABLE BRONZE.LUNAR_FILES ADD SEARCH OPTIMIZATION;
+ALTER TABLE SILVER.PRODUCTS_ENHANCED ADD SEARCH OPTIMIZATION;
+
+-- Create clustering keys for better performance
+ALTER TABLE BRONZE.LUNAR_PRODUCTS CLUSTER BY (START_TIME, INSTRUMENT);
+ALTER TABLE BRONZE.LUNAR_FILES CLUSTER BY (PRODUCT_ID, FILE_TYPE);
+ALTER TABLE BRONZE.PROCESSING_LOG CLUSTER BY (START_TIME, PIPELINE_STAGE);
+
+-- ============================================================================
+-- 7. STORED PROCEDURES FOR COMMON OPERATIONS
+-- ============================================================================
+
+-- Procedure to update processing status
+CREATE OR REPLACE PROCEDURE UPDATE_PROCESSING_STATUS(
+    PRODUCT_ID STRING, 
+    FILE_TYPE STRING, 
+    NEW_STATUS STRING,
+    PROCESSING_RESULTS VARIANT DEFAULT NULL
+)
+RETURNS STRING
+LANGUAGE SQL
+AS
+BEGIN
+    UPDATE BRONZE.LUNAR_FILES 
+    SET PROCESSING_STATUS = :NEW_STATUS,
+        PROCESSING_RESULTS = COALESCE(:PROCESSING_RESULTS, PROCESSING_RESULTS),
+        UPDATED_AT = CURRENT_TIMESTAMP()
+    WHERE PRODUCT_ID = :PRODUCT_ID AND FILE_TYPE = :FILE_TYPE;
+    
+    RETURN 'Status updated for ' || :PRODUCT_ID || ' - ' || :FILE_TYPE;
+END;
+
+-- Procedure to get processing queue
+CREATE OR REPLACE PROCEDURE GET_PROCESSING_QUEUE(LIMIT_COUNT INTEGER DEFAULT 100)
+RETURNS TABLE(PRODUCT_ID STRING, INSTRUMENT STRING, DATA_PRODUCT_TYPE STRING, FILE_PATH STRING)
+LANGUAGE SQL
+AS
+BEGIN
+    RETURN TABLE(
+        SELECT 
+            p.PRODUCT_ID,
+            p.INSTRUMENT,
+            p.DATA_PRODUCT_TYPE,
+            f.FILE_PATH
+        FROM BRONZE.LUNAR_PRODUCTS p
+        JOIN BRONZE.LUNAR_FILES f ON p.PRODUCT_ID = f.PRODUCT_ID
+        WHERE f.PROCESSING_STATUS = 'PENDING'
+          AND f.FILE_TYPE = 'RAW_IMG'
+        ORDER BY p.START_TIME
+        LIMIT :LIMIT_COUNT
+    );
+END;
+
+-- ============================================================================
+-- 8. DATA QUALITY VIEWS
+-- ============================================================================
+
+-- Data quality dashboard view
+CREATE VIEW DATA_QUALITY_SUMMARY AS
+SELECT 
+    'Total Products' AS METRIC,
+    COUNT(*) AS VALUE,
+    NULL AS THRESHOLD
+FROM BRONZE.LUNAR_PRODUCTS
+UNION ALL
+SELECT 
+    'Products with Geometry' AS METRIC,
+    COUNT(*) AS VALUE,
+    COUNT(*) * 1.0 / (SELECT COUNT(*) FROM BRONZE.LUNAR_PRODUCTS) AS THRESHOLD
+FROM BRONZE.LUNAR_PRODUCTS 
+WHERE FOOTPRINT_WKT IS NOT NULL
+UNION ALL
+SELECT 
+    'Processing Success Rate' AS METRIC,
+    COUNT(CASE WHEN f.PROCESSING_STATUS = 'COMPLETED' THEN 1 END) * 100.0 / COUNT(*) AS VALUE,
+    95.0 AS THRESHOLD
+FROM BRONZE.LUNAR_FILES f
+WHERE f.FILE_TYPE = 'RAW_IMG'
+UNION ALL
+SELECT
+    'Avg Processing Time (min)' AS METRIC,
+    AVG(PROCESSING_TIME_SEC) / 60.0 AS VALUE,
+    30.0 AS THRESHOLD  -- 30 minutes threshold
+FROM BRONZE.PROCESSING_LOG
+WHERE STATUS = 'COMPLETED';
+
+-- Create tasks for automated maintenance
+CREATE TASK IF NOT EXISTS REFRESH_SILVER_VIEWS
+  WAREHOUSE = LUNAR_ETL_WH
+  SCHEDULE = 'USING CRON 0 2 * * * UTC'  -- Daily at 2 AM UTC
+AS
+  CREATE OR REPLACE TABLE SILVER.PRODUCTS_ENHANCED AS
+  SELECT 
+      p.*,
+      ST_GEOMFROMWKT(p.FOOTPRINT_WKT) AS FOOTPRINT_GEOM,
+      ST_CENTROID(ST_GEOMFROMWKT(p.FOOTPRINT_WKT)) AS CENTER_GEOM,
+      ST_AREA(ST_GEOMFROMWKT(p.FOOTPRINT_WKT)) AS COVERAGE_AREA_DEG2,
+      CASE 
+          WHEN p.INSTRUMENT LIKE 'NAC%' THEN 'Narrow Angle Camera'
+          WHEN p.INSTRUMENT = 'WAC' THEN 'Wide Angle Camera'
+          ELSE p.INSTRUMENT 
+      END AS INSTRUMENT_FULL_NAME,
+      CASE
+          WHEN p.INCIDENCE_DEG < 10 THEN 'Low Incidence'
+          WHEN p.INCIDENCE_DEG < 45 THEN 'Medium Incidence' 
+          WHEN p.INCIDENCE_DEG < 80 THEN 'High Incidence'
+          ELSE 'Grazing Incidence'
+      END AS INCIDENCE_CATEGORY,
+      CASE
+          WHEN p.RESOLUTION_M < 1.0 THEN 'High Resolution'
+          WHEN p.RESOLUTION_M < 5.0 THEN 'Medium Resolution'
+          ELSE 'Low Resolution'
+      END AS RESOLUTION_CATEGORY,
+      DATEDIFF('day', '2009-06-23', p.START_TIME) AS MISSION_DAY,
+      EXTRACT(YEAR FROM p.START_TIME) AS OBSERVATION_YEAR,
+      EXTRACT(MONTH FROM p.START_TIME) AS OBSERVATION_MONTH
+  FROM BRONZE.LUNAR_PRODUCTS p
+  WHERE p.FOOTPRINT_WKT IS NOT NULL;
+
+-- Enable the task
+ALTER TASK REFRESH_SILVER_VIEWS RESUME;
+
+-- Grant usage on tasks to roles
+GRANT USAGE ON TASK REFRESH_SILVER_VIEWS TO ROLE LUNAR_ENGINEER;
